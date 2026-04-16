@@ -24,13 +24,16 @@ ROLES = ["温和客服"]
 
 @dataclass
 class RouteDecision:
-    intent: str  # default|clone|vision|dialect|role_scene|reset
+    intent: str  # default|clone|vision|dialect|role_scene|reset|wheel_move|wheel_follow_face|wheel_stop
     emotion: Emotion = "neutral"
     query: str = ""
     dialect: Optional[str] = None
     scene: Optional[str] = None
     role: Optional[str] = None
     style_hint: Optional[str] = None
+    move_action: Optional[str] = None
+    move_amount: Optional[str] = None
+    face_lock: bool = True
 
 
 def _safe_json_load(s: str) -> Dict[str, Any]:
@@ -41,6 +44,8 @@ def _safe_json_load(s: str) -> Dict[str, Any]:
 
 
 class IntentDispatcher:
+    """根据用户输入和当前状态，调用 LLM 来判断用户意图并提取参数。"""
+    # 参数：API 密钥、基础 URL、路由模型、文本模型
     def __init__(self, api_key: str, base_url: str, router_model: str, text_model: str) -> None:
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.router_model = router_model
@@ -48,6 +53,7 @@ class IntentDispatcher:
         self.tools = self._build_tools()
 
     def _build_tools(self) -> List[Dict[str, Any]]:
+        """定义工具（工作流），每个工具对应一种用户意图，包含参数说明。"""
         return [
             {"type": "function", "function": {"name": "workflow_default",
                 "description": "默认模式：常规问答/闲聊，没有触发其它模式时使用。",
@@ -104,6 +110,36 @@ class IntentDispatcher:
                 "parameters": {"type": "object",
                     "properties": {"emotion": {"type": "string", "enum": EMOTIONS}},
                     "required": ["emotion"]}}},
+
+            {"type": "function", "function": {"name": "workflow_wheel_move",
+                "description": "轮子移动：当前进、后退、左转、右转、停下等需要控制两驱底盘时使用。",
+                "parameters": {"type": "object",
+                    "properties": {
+                        "emotion": {"type": "string", "enum": EMOTIONS},
+                        "action": {"type": "string", "enum": ["forward", "backward", "turn_left", "turn_right", "stop"]},
+                        "amount": {"type": "string", "enum": ["small", "normal", "large"]},
+                        "face_lock": {"type": "boolean", "default": True},
+                        "query": {"type": "string"}
+                    },
+                    "required": ["emotion", "action"]}}},
+
+            {"type": "function", "function": {"name": "workflow_wheel_follow_face",
+                "description": "开启底盘人脸跟随，让机器人尽量正面朝向用户并保持合适距离。",
+                "parameters": {"type": "object",
+                    "properties": {
+                        "emotion": {"type": "string", "enum": EMOTIONS},
+                        "query": {"type": "string"}
+                    },
+                    "required": ["emotion"]}}},
+
+            {"type": "function", "function": {"name": "workflow_wheel_stop",
+                "description": "停止底盘移动，并退出自动跟随模式。",
+                "parameters": {"type": "object",
+                    "properties": {
+                        "emotion": {"type": "string", "enum": EMOTIONS},
+                        "query": {"type": "string"}
+                    },
+                    "required": ["emotion"]}}},
         ]
 
     def route(self, user_text: str, state: ChatState) -> RouteDecision:
@@ -134,7 +170,7 @@ class IntentDispatcher:
         if not tool_calls:
             return RouteDecision(intent="default", emotion="neutral", query=user_text)
 
-        tc = tool_calls[0]
+        tc = tool_calls[0] # 目前 router 模型输出一个工具调用，取第一个（如果有多个工具调用，可以改进这里的逻辑）
         fn_name = tc.function.name
         args = _safe_json_load(tc.function.arguments or "{}")
 
@@ -178,9 +214,34 @@ class IntentDispatcher:
         if fn_name == "workflow_reset":
             return RouteDecision(intent="reset", emotion=emotion)
 
+        if fn_name == "workflow_wheel_move":
+            return RouteDecision(
+                intent="wheel_move",
+                emotion=emotion,
+                query=str(args.get("query", "")).strip(),
+                move_action=str(args.get("action", "")).strip() or None,
+                move_amount=str(args.get("amount", "normal")).strip() or "normal",
+                face_lock=bool(args.get("face_lock", True)),
+            )
+
+        if fn_name == "workflow_wheel_follow_face":
+            return RouteDecision(
+                intent="wheel_follow_face",
+                emotion=emotion,
+                query=str(args.get("query", "")).strip(),
+            )
+
+        if fn_name == "workflow_wheel_stop":
+            return RouteDecision(
+                intent="wheel_stop",
+                emotion=emotion,
+                query=str(args.get("query", "")).strip(),
+            )
+
         return RouteDecision(intent="default", emotion=emotion, query=user_text)
 
     def _build_chat_system_prompt(self, state: ChatState, emotion: Emotion) -> str:
+        """构建对话提示词，指导后续的对话生成。根据当前状态（如是否克隆音色、方言/角色/场景信息）和情感，生成适当的提示语。"""
         system = (
             "你是语音对话助手。输出要口语化、简洁、适合直接朗读。\n"
             f"本轮情感类型：{emotion}。请用对应语气表达（用词/语气/标点体现）。\n"
@@ -206,6 +267,7 @@ class IntentDispatcher:
         return system
 
     def chat_answer(self, user_text: str, state: ChatState, emotion: Emotion) -> str:
+        """根据用户输入和当前状态，生成助手的回答文本。这个函数会把用户输入和系统提示词加入对话历史，然后调用 LLM 生成回答，并把回答加入对话历史。"""
         system = self._build_chat_system_prompt(state, emotion)
         state.ensure_system(system)
         state.add_user(user_text)

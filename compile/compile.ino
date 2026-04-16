@@ -141,6 +141,109 @@ static void armBusBegin() {
   Serial.println("[ARM-BUS] SCServo Ready.");
 }
 
+// ====================================================================
+// 两驱底盘控制（归一化 v,w -> 左右轮差速）
+// 引脚占用建议：
+// D0(GPIO1)=LEFT_PWM, D1(GPIO2)=LEFT_DIR, D2(GPIO3)=RIGHT_PWM, D3(GPIO4)=RIGHT_DIR
+// 若你使用的电机驱动板引脚不同，可直接修改这里的宏。
+// ====================================================================
+static const int WHEEL_LEFT_PWM_PIN  = 1;
+static const int WHEEL_LEFT_DIR_PIN  = 2;
+static const int WHEEL_RIGHT_PWM_PIN = 3;
+static const int WHEEL_RIGHT_DIR_PIN = 4;
+static const int WHEEL_PWM_MAX       = 255;
+static const uint32_t WHEEL_CMD_TIMEOUT_MS = 1200;
+
+String wheelMode = "STOP";
+float wheelCurrentV = 0.0f;
+float wheelCurrentW = 0.0f;
+uint32_t wheelLastCmdMs = 0;
+
+static float wheelClamp(float v, float lo, float hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static void wheelApplyMotor(int pwmPin, int dirPin, float speed) {
+  speed = wheelClamp(speed, -1.0f, 1.0f);
+  bool forward = speed >= 0.0f;
+  int pwm = (int)(fabsf(speed) * WHEEL_PWM_MAX);
+  digitalWrite(dirPin, forward ? HIGH : LOW);
+  analogWrite(pwmPin, pwm);
+}
+
+static void wheelApplyVW(float v, float w) {
+  v = wheelClamp(v, -1.0f, 1.0f);
+  w = wheelClamp(w, -1.0f, 1.0f);
+  float left = wheelClamp(v - w, -1.0f, 1.0f);
+  float right = wheelClamp(v + w, -1.0f, 1.0f);
+  wheelApplyMotor(WHEEL_LEFT_PWM_PIN, WHEEL_LEFT_DIR_PIN, left);
+  wheelApplyMotor(WHEEL_RIGHT_PWM_PIN, WHEEL_RIGHT_DIR_PIN, right);
+  wheelCurrentV = v;
+  wheelCurrentW = w;
+  wheelLastCmdMs = millis();
+}
+
+static void wheelStopNow() {
+  analogWrite(WHEEL_LEFT_PWM_PIN, 0);
+  analogWrite(WHEEL_RIGHT_PWM_PIN, 0);
+  wheelCurrentV = 0.0f;
+  wheelCurrentW = 0.0f;
+  wheelLastCmdMs = millis();
+}
+
+static void wheelSetMode(const String& mode) {
+  wheelMode = mode;
+  wheelMode.toUpperCase();
+}
+
+static void wheelBegin() {
+  pinMode(WHEEL_LEFT_PWM_PIN, OUTPUT);
+  pinMode(WHEEL_LEFT_DIR_PIN, OUTPUT);
+  pinMode(WHEEL_RIGHT_PWM_PIN, OUTPUT);
+  pinMode(WHEEL_RIGHT_DIR_PIN, OUTPUT);
+  wheelStopNow();
+  Serial.println("[WHEEL] two-drive controller ready");
+}
+
+static void wheelSafetyTick() {
+  if (wheelCurrentV == 0.0f && wheelCurrentW == 0.0f) return;
+  if (millis() - wheelLastCmdMs > WHEEL_CMD_TIMEOUT_MS) {
+    wheelSetMode("STOP");
+    wheelStopNow();
+    Serial.println("[WHEEL] timeout -> stop");
+  }
+}
+
+String wheelStatusJson() {
+  String json = "{";
+  json += "\"mode\":\"" + wheelMode + "\",";
+  json += "\"v\":" + String(wheelCurrentV, 3) + ",";
+  json += "\"w\":" + String(wheelCurrentW, 3) + ",";
+  json += "\"timeout_ms\":" + String(WHEEL_CMD_TIMEOUT_MS);
+  json += "}";
+  return json;
+}
+
+void handleWheelStatus() {
+  server.send(200, "application/json", wheelStatusJson());
+}
+
+void handleWheelCmd() {
+  float v = server.hasArg("v") ? server.arg("v").toFloat() : 0.0f;
+  float w = server.hasArg("w") ? server.arg("w").toFloat() : 0.0f;
+  if (server.hasArg("mode")) wheelSetMode(server.arg("mode"));
+  wheelApplyVW(v, w);
+  server.send(200, "application/json", wheelStatusJson());
+}
+
+void handleWheelStop() {
+  wheelSetMode("STOP");
+  wheelStopNow();
+  server.send(200, "application/json", wheelStatusJson());
+}
+
 // 嘴部舵机（通道8）实时音量驱动
 const uint8_t  MOUTH_SERVO_CH        = 9;    // 嘴巴舵机通道改为9
 const int      MOUTH_CLOSED_ANGLE    = 29;   // 嘴巴闭合角度
@@ -2534,6 +2637,7 @@ void setup() {
   Serial.println("[WiFi] DISABLED - Running in offline mode");
   #endif
 
+  delay(500);
   // Camera
   if (!init_camera()) { Serial.println("[CAM] init failed, reboot..."); delay(1500); esp_restart(); }
 
@@ -2562,6 +2666,7 @@ void setup() {
 
   // SCServo 总线舵机初始化（机械臂）
   armBusBegin();
+  wheelBegin();
   // 机械臂归中位
   for (int id = 1; id <= 4; id++) {
     armMoveServo(id, ARM_LIMITS[id].midV, ARM_DEFAULT_SPEED, ARM_DEFAULT_ACC);
@@ -2606,13 +2711,16 @@ void setup() {
   server.on("/arm/status", handleArmStatus);          // 机械臂状态
   server.on("/arm/servo", handleArmServoSingle);      // 单个机械臂舵机
   server.on("/arm/batch", handleArmBatch);            // 批量机械臂控制
+  server.on("/wheel/status", handleWheelStatus);      // 底盘状态
+  server.on("/wheel/cmd", handleWheelCmd);            // 底盘 v,w 控制
+  server.on("/wheel/stop", handleWheelStop);          // 底盘急停
   // LED路由已移除（无硬件）
   server.on("/expression", handleExpression);
   server.on("/expr_editor", handleExpressionEditor);
   server.on("/expr_save", HTTP_POST, handleExpressionSave);
   server.on("/expr_get", handleExpressionGet);
   server.begin();
-  Serial.println("[HTTP] server started (servo + arm + expression + priority control)");
+  Serial.println("[HTTP] server started (servo + arm + wheel + expression + priority control)");
   #endif
 
   // WebSocket 回调
@@ -2774,7 +2882,31 @@ void setup() {
       }
     }
     
-    // 8) 嘴型控制命令：MOUTH:vowel 或 MOUTH:vowel,volume
+    // 8) 两驱底盘控制命令
+    else if (s.startsWith("WHEEL:MODE:")) {
+      String mode = s.substring(strlen("WHEEL:MODE:"));
+      mode.trim();
+      wheelSetMode(mode);
+      Serial.printf("[WS-AUD] wheel mode=%s\n", mode.c_str());
+    }
+    else if (s.startsWith("WHEEL:CMD:")) {
+      String params = s.substring(strlen("WHEEL:CMD:"));
+      params.trim();
+      int comma = params.indexOf(',');
+      if (comma > 0) {
+        float v = params.substring(0, comma).toFloat();
+        float w = params.substring(comma + 1).toFloat();
+        wheelApplyVW(v, w);
+        Serial.printf("[WS-AUD] wheel cmd v=%.3f w=%.3f\n", v, w);
+      }
+    }
+    else if (s == "WHEEL:STOP") {
+      wheelSetMode("STOP");
+      wheelStopNow();
+      Serial.println("[WS-AUD] wheel stop");
+    }
+    
+    // 9) 嘴型控制命令：MOUTH:vowel 或 MOUTH:vowel,volume
     // 元音决定嘴型形状，音量由 ESP32 本地实时计算
     else if (s.startsWith("MOUTH:")) {
       String params = s.substring(6);
@@ -2786,7 +2918,7 @@ void setup() {
       }
     }
     
-    // 9) 眼皮控制命令：EYELID:xxx
+    // 10) 眼皮控制命令：EYELID:xxx
     // 用于手部遮挡时的眼皮动画
     else if (s.startsWith("EYELID:")) {
       String cmd = s.substring(7);
@@ -2927,6 +3059,35 @@ void processSerialCommand(String cmd) {
     return;
   }
   
+  if (cmd.startsWith("WHEEL:MODE:")) {
+    String mode = cmd.substring(strlen("WHEEL:MODE:"));
+    mode.trim();
+    wheelSetMode(mode);
+    Serial.printf("OK:WHEEL MODE=%s\n", mode.c_str());
+    return;
+  }
+
+  if (cmd.startsWith("WHEEL:CMD:")) {
+    String params = cmd.substring(strlen("WHEEL:CMD:"));
+    int comma = params.indexOf(',');
+    if (comma > 0) {
+      float v = params.substring(0, comma).toFloat();
+      float w = params.substring(comma + 1).toFloat();
+      wheelApplyVW(v, w);
+      Serial.printf("OK:WHEEL CMD v=%.3f w=%.3f\n", v, w);
+    } else {
+      Serial.println("ERR:WHEEL:CMD format is WHEEL:CMD:v,w");
+    }
+    return;
+  }
+
+  if (cmd == "WHEEL:STOP") {
+    wheelSetMode("STOP");
+    wheelStopNow();
+    Serial.println("OK:WHEEL STOP");
+    return;
+  }
+  
   if (cmd.startsWith("EXPR:")) {
     String exprName = cmd.substring(5);
     exprName.trim();
@@ -2977,6 +3138,7 @@ void loop() {
   
   // 串口命令处理（树莓派通过USB控制，始终可用）
   checkSerialCommands();
+  wheelSafetyTick();
   
 #if ENABLE_WIFI
   // ========== 网络模式 ==========

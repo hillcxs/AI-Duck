@@ -9,6 +9,8 @@
   const $btnClear  = document.getElementById('btnClear');
   const $btnRe     = document.getElementById('btnReconnect');
   const $fps       = document.getElementById('fps');
+  const $wheelMode = document.getElementById('wheelMode');
+  const $wheelFace = document.getElementById('wheelFace');
   const canvas     = document.getElementById('canvas');
   const ctx        = canvas.getContext('2d');
 
@@ -226,6 +228,13 @@
     ud: 90,
     log: ''
   };
+  let wheelStateData = {
+    mode: 'stop',
+    face_lock: true,
+    v: 0,
+    w: 0,
+    face_detected: false
+  };
 
   function drawBlob(buf){
     const blob = new Blob([buf], {type:'image/jpeg'});
@@ -349,6 +358,24 @@
     logDiv.textContent = data.log || '等待检测...';
   }
 
+  function updateWheelUI(data) {
+    wheelStateData = Object.assign({}, wheelStateData, data || {});
+    if ($wheelMode) {
+      $wheelMode.textContent = `Wheel: ${wheelStateData.mode} v=${Number(wheelStateData.v || 0).toFixed(2)} w=${Number(wheelStateData.w || 0).toFixed(2)}`;
+      $wheelMode.className = 'badge ' + (wheelStateData.mode === 'stop' ? '' : 'ok');
+    }
+    if ($wheelFace) {
+      let faceText = 'Face lock: off';
+      if (wheelStateData.face_lock) {
+        faceText = wheelStateData.face_detected
+          ? `Face lock: on (${Number(wheelStateData.face_offset_x || 0).toFixed(2)})`
+          : 'Face lock: waiting face';
+      }
+      $wheelFace.textContent = faceText;
+      $wheelFace.className = 'badge ' + (wheelStateData.face_lock ? 'ok' : '');
+    }
+  }
+
   function connectCamera(){
     try{ if (wsCam) wsCam.close(); }catch(e){}
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -375,6 +402,7 @@
         try{
           const data = JSON.parse(s.slice(5));
           $partial.textContent = data.partial || '（等待音频…）';
+          if (data.wheel) updateWheelUI(data.wheel);
           
           // 初始化时加载历史消息（[AI] 前缀识别）
           if (data.finals && data.finals.length > 0) {
@@ -415,6 +443,15 @@
         }
         return;
       }
+      if (s.startsWith('WHEELSTATE:')){
+        try {
+          const data = JSON.parse(s.slice(11));
+          updateWheelUI(data);
+        } catch(e) {
+          console.error('[WHEEL] parse failed:', e);
+        }
+        return;
+      }
     }
   }
 
@@ -429,7 +466,7 @@
 
   // ========== 表情控制 ==========
   function setupExpressionButtons() {
-    const exprButtons = document.querySelectorAll('.expr-btn');
+    const exprButtons = document.querySelectorAll('.expr-btn[data-expr]');
     let activeBtn = null;
     
     exprButtons.forEach(btn => {
@@ -462,9 +499,26 @@
     
     console.log(`[EXPR] 已绑定 ${exprButtons.length} 个表情按钮`);
   }
+
+  function setupWheelButtons() {
+    const wheelButtons = document.querySelectorAll('.expr-btn[data-wheel]');
+    wheelButtons.forEach(btn => {
+      btn.addEventListener('click', () => {
+        const cmd = btn.dataset.wheel;
+        if (!cmd) return;
+        if (wsUI && wsUI.readyState === WebSocket.OPEN) {
+          wsUI.send(`WHEEL:${cmd}`);
+          addMessage(`底盘控制: ${cmd}`, false);
+        } else {
+          alert('WebSocket 未连接，无法发送轮子控制命令');
+        }
+      });
+    });
+  }
   
   // 初始化
   setupExpressionButtons();
+  setupWheelButtons();
   connectCamera();
   connectASR();
 })();

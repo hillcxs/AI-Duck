@@ -784,6 +784,7 @@ async def process_face_tracking(jpeg_bytes: bytes, audio_ws):
         
         # 遮挡状态下也可以让眼球跟随手部（如果想要的话）
         # 但根据需求，遮挡时主要是眼皮动画，眼球可以不动
+        await tick_wheel_control(False, None)
         await broadcast_face_track_state()
         return
     else:
@@ -793,6 +794,8 @@ async def process_face_tracking(jpeg_bytes: bytes, audio_ws):
     
     # ========== 4. 人脸/手部追踪 - 眼球跟随 ==========
     detected = False
+    wheel_face_detected = False
+    wheel_face_box = None
     target_lr = EYE_LR_CENTER
     target_ud = EYE_UD_CENTER
     face_box = None
@@ -827,9 +830,11 @@ async def process_face_tracking(jpeg_bytes: bytes, audio_ws):
         face_detected, face_lr, face_ud, face_box_result, face_log = detect_face_yolo(jpeg_bytes)
         if face_detected:
             detected = True
+            wheel_face_detected = True
             target_lr = face_lr
             target_ud = face_ud
             face_box = face_box_result
+            wheel_face_box = face_box_result
             log_msg = f"[脸] {face_log}"
         else:
             log_msg = face_log
@@ -865,6 +870,7 @@ async def process_face_tracking(jpeg_bytes: bytes, audio_ws):
                             await audio_ws.send_text("EYE:IDLE")
                     except Exception as e:
                         print(f"[TRACK] 发送 EYE:IDLE 失败: {e}", flush=True)
+            await tick_wheel_control(False, None)
             await broadcast_face_track_state()
             return
     
@@ -887,6 +893,7 @@ async def process_face_tracking(jpeg_bytes: bytes, audio_ws):
             print(f"[TRACK] 发送眼球命令失败: {e}", flush=True)
     
     # 广播状态到前端
+    await tick_wheel_control(wheel_face_detected, wheel_face_box)
     await broadcast_face_track_state()
 
 # 人脸追踪状态广播
@@ -945,6 +952,31 @@ clone_audio_buffer: List[bytes] = []  # 克隆音频缓冲区
 clone_start_time: float = 0.0  # 克隆开始时间
 clone_duration: int = 7  # 克隆录音时长（秒）
 clone_event: Optional[asyncio.Event] = None  # 克隆完成事件
+
+# ========== 两驱底盘控制相关状态 ==========
+WHEEL_CONTROL_ENABLED = True
+WHEEL_FACE_TARGET_AREA = 0.16        # 人脸目标面积，越大表示期望距离越近
+WHEEL_FACE_AREA_DEADBAND = 0.025     # 距离误差死区
+WHEEL_TURN_ENTER_X = 0.24            # 超过该水平偏移时底盘开始接管转向
+WHEEL_TURN_EXIT_X = 0.18             # 回到该阈值内才释放底盘转向
+WHEEL_MAX_LINEAR = 0.32              # 线速度上限（归一化）
+WHEEL_MAX_ANGULAR = 0.55             # 角速度上限（归一化）
+WHEEL_MIN_ANGULAR = 0.16             # 一旦进入转向区，至少给一点可克服静摩擦的角速度
+WHEEL_CMD_EPS = 0.03                 # 小于该变化量不重复下发底盘命令
+
+wheel_state = {
+    "mode": "stop",                  # stop | manual | voice_move | follow_face
+    "face_lock": True,               # 语音移动时若检测到人脸，是否自动保持正对
+    "base_v": 0.0,                   # 手动/语音模式的基准线速度
+    "base_w": 0.0,                   # 手动/语音模式的基准角速度
+    "current_v": 0.0,                # 当前已下发线速度
+    "current_w": 0.0,                # 当前已下发角速度
+    "deadline_ts": 0.0,              # manual/voice_move 超时停止时间
+    "turn_engaged": False,           # 迟滞状态：底盘是否已接管转向
+    "last_face_detected": False,     # 最近一帧是否检测到人脸
+    "last_face_area": 0.0,           # 最近一帧人脸面积
+    "last_face_offset_x": 0.0,       # 最近一帧水平偏移
+}
 
 # 入参：pcm_data: 原始 PCM 音频数据（bytes） sample_rate: 音频采样率（Hz） state_holder: 状态持有对象（用于存储颤音效果的相位等状态）
 def apply_donald_duck_effect(pcm_data: bytes, sample_rate: int, state_holder):
@@ -1063,6 +1095,7 @@ async def full_system_reset(reason: str = ""):
     """
     # 1) 音频&AI
     await hard_reset_audio(reason or "full_system_reset")
+    await stop_wheels(reason or "full_system_reset", force=True)
 
     # 2) ASR
     await stop_current_recognition()
@@ -1086,6 +1119,180 @@ async def full_system_reset(reason: str = ""):
         pass
 
     print("[SYSTEM] full reset done.", flush=True)
+
+
+def _wheel_payload() -> Dict[str, Any]:
+    return {
+        "mode": wheel_state["mode"],
+        "face_lock": wheel_state["face_lock"],
+        "v": round(float(wheel_state["current_v"]), 3),
+        "w": round(float(wheel_state["current_w"]), 3),
+        "face_detected": bool(wheel_state["last_face_detected"]),
+        "face_area": round(float(wheel_state["last_face_area"]), 4),
+        "face_offset_x": round(float(wheel_state["last_face_offset_x"]), 4),
+    }
+
+
+async def ui_broadcast_wheel_state():
+    await ui_broadcast_raw("WHEELSTATE:" + json.dumps(_wheel_payload(), ensure_ascii=False))
+
+
+async def _send_wheel_command(v: float, w: float, mode: Optional[str] = None, force: bool = False):
+    v = max(-WHEEL_MAX_LINEAR, min(WHEEL_MAX_LINEAR, float(v)))
+    w = max(-WHEEL_MAX_ANGULAR, min(WHEEL_MAX_ANGULAR, float(w)))
+
+    mode_changed = False
+    if mode and wheel_state["mode"] != mode:
+        wheel_state["mode"] = mode
+        mode_changed = True
+
+    changed = (
+        force
+        or mode_changed
+        or abs(v - float(wheel_state["current_v"])) >= WHEEL_CMD_EPS
+        or abs(w - float(wheel_state["current_w"])) >= WHEEL_CMD_EPS
+    )
+
+    wheel_state["current_v"] = v
+    wheel_state["current_w"] = w
+
+    if changed and esp32_audio_ws and (esp32_audio_ws.client_state == WebSocketState.CONNECTED):
+        try:
+            await esp32_audio_ws.send_text(f"WHEEL:MODE:{wheel_state['mode'].upper()}")
+            await esp32_audio_ws.send_text(f"WHEEL:CMD:{v:.3f},{w:.3f}")
+        except Exception as e:
+            print(f"[WHEEL] send failed: {e}", flush=True)
+
+    if changed:
+        await ui_broadcast_wheel_state()
+
+
+async def stop_wheels(reason: str = "", force: bool = False):
+    wheel_state["deadline_ts"] = 0.0
+    wheel_state["base_v"] = 0.0
+    wheel_state["base_w"] = 0.0
+    wheel_state["turn_engaged"] = False
+    await _send_wheel_command(0.0, 0.0, mode="stop", force=True if force else False)
+    if reason:
+        print(f"[WHEEL] stop: {reason}", flush=True)
+
+
+def _face_turn_from_box(face_box: Optional[dict]) -> float:
+    if not face_box:
+        wheel_state["turn_engaged"] = False
+        return 0.0
+
+    center_x = float(face_box.get("x", 0.0)) + float(face_box.get("w", 0.0)) / 2.0
+    offset_x = (center_x - 0.5) * 2.0
+    wheel_state["last_face_offset_x"] = offset_x
+
+    abs_x = abs(offset_x)
+    if wheel_state["turn_engaged"]:
+        if abs_x <= WHEEL_TURN_EXIT_X:
+            wheel_state["turn_engaged"] = False
+            return 0.0
+    else:
+        if abs_x < WHEEL_TURN_ENTER_X:
+            return 0.0
+        wheel_state["turn_engaged"] = True
+
+    excess = max(0.0, abs_x - WHEEL_TURN_ENTER_X)
+    denom = max(1e-6, 1.0 - WHEEL_TURN_ENTER_X)
+    ratio = min(1.0, excess / denom)
+    mag = max(WHEEL_MIN_ANGULAR, ratio * WHEEL_MAX_ANGULAR)
+    return (-1.0 if offset_x > 0 else 1.0) * mag
+
+
+def _face_follow_linear(face_box: Optional[dict]) -> float:
+    if not face_box:
+        return 0.0
+    area = float(face_box.get("w", 0.0)) * float(face_box.get("h", 0.0))
+    wheel_state["last_face_area"] = area
+    err = WHEEL_FACE_TARGET_AREA - area
+    if abs(err) <= WHEEL_FACE_AREA_DEADBAND:
+        return 0.0
+    normalized = err / max(0.05, WHEEL_FACE_TARGET_AREA)
+    return max(-WHEEL_MAX_LINEAR, min(WHEEL_MAX_LINEAR, normalized * 0.45))
+
+
+def _voice_motion_profile(action: Optional[str], amount: Optional[str]) -> Tuple[float, float, float, bool]:
+    amount = (amount or "normal").lower()
+    duration_map = {"small": 0.9, "normal": 1.6, "large": 2.4}
+    duration = duration_map.get(amount, 1.6)
+    action = (action or "").lower()
+    if action == "forward":
+        return (0.24, 0.0, duration, True)
+    if action == "backward":
+        return (-0.22, 0.0, duration, True)
+    if action == "turn_left":
+        return (0.0, 0.42, max(0.8, duration * 0.8), False)
+    if action == "turn_right":
+        return (0.0, -0.42, max(0.8, duration * 0.8), False)
+    return (0.0, 0.0, 0.0, False)
+
+
+async def activate_voice_move(action: Optional[str], amount: Optional[str], face_lock: bool = True):
+    v, w, duration, default_face_lock = _voice_motion_profile(action, amount)
+    if action == "stop" or duration <= 0:
+        await stop_wheels("voice stop", force=True)
+        return
+    wheel_state["base_v"] = v
+    wheel_state["base_w"] = w
+    wheel_state["face_lock"] = bool(face_lock and default_face_lock)
+    wheel_state["deadline_ts"] = time.time() + duration
+    await _send_wheel_command(v, w, mode="voice_move", force=True)
+
+
+async def set_follow_face_enabled(enabled: bool):
+    if enabled:
+        wheel_state["base_v"] = 0.0
+        wheel_state["base_w"] = 0.0
+        wheel_state["deadline_ts"] = 0.0
+        wheel_state["face_lock"] = True
+        wheel_state["turn_engaged"] = False
+        await _send_wheel_command(0.0, 0.0, mode="follow_face", force=True)
+    else:
+        await stop_wheels("follow face disabled", force=True)
+
+
+async def tick_wheel_control(face_detected: bool, face_box: Optional[dict]):
+    if not WHEEL_CONTROL_ENABLED:
+        return
+
+    now = time.time()
+    wheel_state["last_face_detected"] = bool(face_detected)
+    if not face_detected:
+        wheel_state["last_face_area"] = 0.0
+        wheel_state["last_face_offset_x"] = 0.0
+
+    mode = wheel_state["mode"]
+    if mode == "stop":
+        if wheel_state["current_v"] != 0.0 or wheel_state["current_w"] != 0.0:
+            await _send_wheel_command(0.0, 0.0, mode="stop")
+        return
+
+    if mode in ("manual", "voice_move") and wheel_state["deadline_ts"] and now >= float(wheel_state["deadline_ts"]):
+        await stop_wheels("motion expired", force=True)
+        return
+
+    desired_v = float(wheel_state["base_v"])
+    desired_w = float(wheel_state["base_w"])
+
+    if mode == "follow_face":
+        if face_detected and face_box:
+            desired_v = _face_follow_linear(face_box)
+            desired_w = _face_turn_from_box(face_box)
+        else:
+            desired_v = 0.0
+            desired_w = 0.0
+    elif mode == "voice_move":
+        if wheel_state["face_lock"] and face_detected and face_box:
+            desired_w = _face_turn_from_box(face_box)
+    elif mode == "manual":
+        if wheel_state["face_lock"] and face_detected and face_box and abs(desired_v) > 0.01:
+            desired_w = _face_turn_from_box(face_box)
+
+    await _send_wheel_command(desired_v, desired_w, mode=mode)
 
 
 # ========= 新语音系统播放启动 =========
@@ -1243,6 +1450,37 @@ async def start_ai_with_text(user_text: str):
                 await _speak_text_to_broadcast(reply_text, chat_state.current_voice, instruction, cartoon_states)
                 txt_buf.append(reply_text)
                 
+            elif decision.intent == "wheel_move":
+                await activate_voice_move(decision.move_action, decision.move_amount, face_lock=decision.face_lock)
+                reply_text = "好的，我开始移动了。"
+                if decision.move_action == "forward":
+                    reply_text = "好的，我向前移动一点。"
+                elif decision.move_action == "backward":
+                    reply_text = "好的，我向后退一点。"
+                elif decision.move_action == "turn_left":
+                    reply_text = "好的，我向左转一点。"
+                elif decision.move_action == "turn_right":
+                    reply_text = "好的，我向右转一点。"
+                elif decision.move_action == "stop":
+                    reply_text = "好的，我已经停下了。"
+                instruction = chat_state.build_tts_instruction(emotion)
+                await _speak_text_to_broadcast(reply_text, chat_state.current_voice, instruction, cartoon_states)
+                txt_buf.append(reply_text)
+
+            elif decision.intent == "wheel_follow_face":
+                await set_follow_face_enabled(True)
+                reply_text = "好的，我会尽量正面朝向你，并保持合适距离。"
+                instruction = chat_state.build_tts_instruction(emotion)
+                await _speak_text_to_broadcast(reply_text, chat_state.current_voice, instruction, cartoon_states)
+                txt_buf.append(reply_text)
+
+            elif decision.intent == "wheel_stop":
+                await stop_wheels("voice intent stop", force=True)
+                reply_text = "好的，我已经停止移动。"
+                instruction = chat_state.build_tts_instruction(emotion)
+                await _speak_text_to_broadcast(reply_text, chat_state.current_voice, instruction, cartoon_states)
+                txt_buf.append(reply_text)
+
             elif decision.intent == "vision":
                 # ★ 流式视觉问答（优化版：base64直传 + 流式输出）
                 question = (decision.query or "").strip() or user_text
@@ -1565,7 +1803,7 @@ async def ws_ui(ws: WebSocket):
     await ws.accept()
     ui_clients[id(ws)] = ws
     try:
-        init = {"partial": current_partial, "finals": recent_finals[-10:]}
+        init = {"partial": current_partial, "finals": recent_finals[-10:], "wheel": _wheel_payload()}
         await ws.send_text("INIT:" + json.dumps(init, ensure_ascii=False))
         while True:
             # 接收前端发来的命令（表情控制等）
@@ -1584,6 +1822,20 @@ async def ws_ui(ws: WebSocket):
                         print(f"[UI] 已发送 EMO+EXPR 指令到 ESP32: {expr_name}", flush=True)
                     else:
                         print("[UI] ESP32 未连接，无法发送表情命令", flush=True)
+                elif msg.startswith("WHEEL:"):
+                    payload = msg[6:].strip()
+                    if payload == "STOP":
+                        await stop_wheels("ui stop", force=True)
+                    elif payload == "FOLLOW_FACE:ON":
+                        await set_follow_face_enabled(True)
+                    elif payload == "FOLLOW_FACE:OFF":
+                        await set_follow_face_enabled(False)
+                    elif payload.startswith("MOVE:"):
+                        _, action, *rest = payload.split(":")
+                        amount = rest[0] if rest else "normal"
+                        await activate_voice_move(action.lower(), amount.lower(), face_lock=True)
+                        await _send_wheel_command(wheel_state["current_v"], wheel_state["current_w"], mode="manual", force=True)
+                    await ui_broadcast_wheel_state()
             except asyncio.TimeoutError:
                 # 超时继续循环
                 continue
@@ -1998,6 +2250,7 @@ async def on_shutdown():
     
     # 停止音频和AI任务
     await hard_reset_audio("shutdown")
+    await stop_wheels("shutdown", force=True)
     
     print("[SHUTDOWN] 资源清理完成")
 
