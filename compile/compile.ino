@@ -154,6 +154,9 @@ static const int WHEEL_RIGHT_DIR_PIN = 4;
 static const int WHEEL_PWM_MAX       = 255;
 static const uint32_t WHEEL_CMD_TIMEOUT_MS = 1200;
 
+// 前置声明：底盘 HTTP 处理函数定义在前，WebServer 实例定义在后。
+extern WebServer server;
+
 String wheelMode = "STOP";
 float wheelCurrentV = 0.0f;
 float wheelCurrentW = 0.0f;
@@ -3246,4 +3249,3 @@ void loop() {
 
   delay(2);
 }
-
