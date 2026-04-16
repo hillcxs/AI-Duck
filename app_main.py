@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 # import threading  # 已移除：不再需要音频初始化线程
 # ---- Windows 事件循环策略 ----
+# 解决 Windows 下 asyncio bug
 if sys.platform.startswith("win"):
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -22,6 +23,7 @@ if sys.platform.startswith("win"):
         pass
 
 # ---- .env ----
+# 加载环境变量（如果存在 .env 文件）
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -29,13 +31,20 @@ except Exception:
     pass
 
 # ---- 新语音系统配置 ----
+# 加载阿里大模型API配置：这里不应该提供默认值
 API_KEY = os.getenv("DASHSCOPE_API_KEY", "sk-3a6b1a3bd7124023a7ac7699d49c2caf")
 if not API_KEY:
     raise RuntimeError("未设置 DASHSCOPE_API_KEY")
 
+# 采样率（sample rate），单位 Hz。表示每秒采样 16000 次（常用语音识别值，16kHz）。
 SAMPLE_RATE = 16000
+# 音频帧长度（chunk length），单位毫秒。表示每次处理 20ms 语音数据。
 CHUNK_MS = 20
+# 计算 20ms 的字节数。
+# SAMPLE_RATE * CHUNK_MS // 1000 先得帧内采样点数：16000*20/1000 = 320 样本。* 2 表示每个样本 2 字节（16-bit PCM，通常是 int16）。
 BYTES_CHUNK = SAMPLE_RATE * CHUNK_MS // 1000 * 2
+# 生成一个静音数据块：全 0 字节串，长度 640。
+# 用于填充、预热、静音检测、断句时补齐等场景。
 SILENCE_20MS = bytes(BYTES_CHUNK)
 
 # ---- 引入新语音系统模块 ----
@@ -45,9 +54,11 @@ from robotduck_voice_assistant.workflows import Workflows
 from robotduck_voice_assistant.state import ChatState
 
 # 初始化新语音系统
+# 根据名称获取环境变量，load_dotenv()已经加载了 .env 文件中的变量
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
+# 配置模型调用API和默认声音
 BASE_URL = _env("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 WS_URL = _env("DASHSCOPE_WS_BASE_URL", "wss://dashscope.aliyuncs.com/api-ws/v1/inference")
 ROUTER_MODEL = _env("ROUTER_MODEL", "qwen-turbo")
@@ -57,6 +68,7 @@ TTS_MODEL = _env("TTS_MODEL", "cosyvoice-v3-plus")
 DEFAULT_VOICE = _env("DEFAULT_VOICE", "longanhuan")
 
 # 初始化状态和引擎（在应用启动时初始化）
+# 系统关系：ASR → dispatcher → workflows → TTS
 chat_state: Optional[ChatState] = None
 asr_engine: Optional[WebSocketASREngine] = None
 tts_engine: Optional[BroadcastTTSEngine] = None
@@ -66,7 +78,9 @@ workflows: Optional[Workflows] = None
 def init_voice_system():
     """初始化新语音系统"""
     global chat_state, asr_engine, tts_engine, dispatcher, workflows
+    # 对话状态管理：当前使用的音色、对话历史等
     chat_state = ChatState(default_voice=DEFAULT_VOICE, current_voice=DEFAULT_VOICE, max_turns=8)
+    # asr：语音-》文本，tts：文本-》语音
     asr_engine = WebSocketASREngine(api_key=API_KEY, sample_rate=SAMPLE_RATE, ws_url=WS_URL)
     tts_engine = BroadcastTTSEngine(api_key=API_KEY, tts_model=TTS_MODEL, default_voice=DEFAULT_VOICE, sample_rate=SAMPLE_RATE)
     dispatcher = IntentDispatcher(api_key=API_KEY, base_url=BASE_URL, router_model=ROUTER_MODEL, text_model=TEXT_MODEL)
@@ -92,10 +106,11 @@ def init_voice_system():
     )
     print("[VOICE] 新语音系统初始化完成（视觉问答使用ESP32摄像头）", flush=True)
 
-# 情绪映射函数：将新系统情绪映射到ESP32表情
+
 def map_emotion_to_esp32_expr(emotion: str) -> str:
     """
-    将新系统的情绪类型映射到ESP32的表情名称
+    情绪映射函数：将新系统情绪映射到ESP32表情，返回对应的表情名称字符串。ESP32端根据这个字符串执行相应的表情动画。
+    AI输出情绪 → 映射 → ESP32表情
     不改新系统的情绪名称（因为要发送给大模型API）
     """
     emotion_lower = emotion.lower().strip()
@@ -147,11 +162,17 @@ _current_recognition = None
 _rec_lock = asyncio.Lock()
 
 async def set_current_recognition(r):
+    """
+    设置当前语音识别对象
+    """
     global _current_recognition
     async with _rec_lock:
         _current_recognition = r
 
 async def stop_current_recognition():
+    """
+    停止当前语音识别
+    """
     global _current_recognition
     async with _rec_lock:
         r = _current_recognition
@@ -166,6 +187,7 @@ async def stop_current_recognition():
 # Python 端只需发送 EXPR:xxx 指令到 WebSocket
 
 # ==================== 元音分析器（嘴型控制）====================
+# 数据流：ESP32 发送 20ms PCM 音频数据 → VowelAnalyzer 分析出元音类别和音量 → 发送嘴型指令到 ESP32
 class VowelAnalyzer:
     """基于 LPC 共振峰分析的元音识别器，用于驱动嘴巴动画"""
     
@@ -414,7 +436,7 @@ def init_hand_detector():
         import mediapipe as mp
         from mediapipe.tasks import python
         from mediapipe.tasks.python import vision
-        
+        # hand_landmarker手部检测模型，包含21个关键点，支持多手检测和跟踪
         model_path = os.path.join(os.path.dirname(__file__), "model", "hand_landmarker.task")
         if not os.path.exists(model_path):
             print(f"[HAND] 手部模型不存在: {model_path}", flush=True)
@@ -437,6 +459,14 @@ def init_hand_detector():
 
 def detect_hand(frame_rgb) -> dict:
     """
+    手部检测函数：输入 RGB 图像，输出手部信息
+    {
+    "detected": 是否检测到手,
+    "center_x": 手中心x,
+    "center_y": 手中心y,
+    "area_ratio": 手占画面比例,
+    "box": 边界框
+    }
     检测手部并返回手部信息
     返回: {detected, center_x, center_y, area_ratio, box}
     """
@@ -501,7 +531,7 @@ import random
 
 async def process_hand_cover_animation(hand_area_ratio: float, audio_ws, now_ms: float):
     """
-    处理手部遮挡时的眼皮动画状态机
+    处理手部遮挡动画状态机:快速眨眼/偷看/闭眼/恢复
     - 手部面积 > 50%: 触发遮眼动画
     - 快速眨几下 → 闭眼 → 间歇性睁一只眼
     """
@@ -590,10 +620,12 @@ async def process_hand_cover_animation(hand_area_ratio: float, audio_ws, now_ms:
 
 def nonlinear_eye_map(offset: float, total_range: float) -> int:
     """
+    根据人脸偏移计算眼球转动角度，使用非线性映射增强小偏移的响应
+    
     非线性眼球映射：小偏移→大转动
     - 人脸偏移 0~30% → 眼球转动 70% 角度范围
     - 人脸偏移 30%~100% → 眼球转动剩余 30% 角度范围
-    
+
     offset: -1 到 1 的偏移值
     total_range: 眼球角度半范围（从中心到最大/最小的距离）
     返回: 相对于中心的角度偏移量
@@ -638,7 +670,7 @@ def detect_face_yolo(jpeg_bytes: bytes) -> tuple:
         h, w = frame.shape[:2]
         
         # YOLO 推理（静默模式）
-        results = yolo_face_model(frame, verbose=False, conf=0.5)
+        results = yolo_face_model(frame, verbose=False, conf=0.5) # verbose=False 关闭冗长日志，conf=0.5 设置置信度阈值
         
         # 解析结果
         if len(results) == 0 or len(results[0].boxes) == 0:
@@ -710,7 +742,7 @@ async def process_face_tracking(jpeg_bytes: bytes, audio_ws):
     if not FACE_TRACK_ENABLED:
         return
     
-    # 帧计数，降低检测频率
+    # 帧计数，降低检测频率 （每隔 FACE_DETECT_INTERVAL 帧检测一次）
     face_track_state["frame_count"] += 1
     if face_track_state["frame_count"] % FACE_DETECT_INTERVAL != 0:
         return
@@ -718,6 +750,7 @@ async def process_face_tracking(jpeg_bytes: bytes, audio_ws):
     now = time.time() * 1000  # 毫秒
     
     # ========== 1. 解码图像（共用） ==========
+    # 解码 JPEG 图像为 BGR，然后转换为 RGB（MediaPipe 需要 RGB）
     try:
         nparr = np.frombuffer(jpeg_bytes, np.uint8)
         frame_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -893,18 +926,18 @@ async def broadcast_face_track_state():
 app = FastAPI()
 
 # ====== 状态与容器 ======
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory="static"), name="static") # 挂载 /static 下前端静态资源目录（CSS、JS 文件）在路由
 
-ui_clients: Dict[int, WebSocket] = {}
-current_partial: str = ""
-recent_finals: List[str] = []
+ui_clients: Dict[int, WebSocket] = {} # 连接到 UI 的 WebSocket 客户端，key 是 id(ws)，value 是 WebSocket 对象
+current_partial: str = "" # 当前正在说的部分文本（实时更新）
+recent_finals: List[str] = [] # 最近说的完整文本列表（保留最后50条）
 RECENT_MAX = 50
-last_frames: Deque[Tuple[float, bytes]] = deque(maxlen=10)
+last_frames: Deque[Tuple[float, bytes]] = deque(maxlen=10) # 最近的视频帧，存储 (timestamp, jpeg_bytes)，用于高清抓拍功能
 
-camera_viewers: Set[WebSocket] = set()
-esp32_camera_ws: Optional[WebSocket] = None
+camera_viewers: Set[WebSocket] = set() # 连接到视频流的 WebSocket 客户端集合，支持多人同时观看
+esp32_camera_ws: Optional[WebSocket] = None # ESP32 摄像头 WebSocket 连接（单一连接）从硬件接收视频流
 # imu_ws_clients: Set[WebSocket] = set()  # 已移除：ESP32不再使用UDP发送IMU数据
-esp32_audio_ws: Optional[WebSocket] = None
+esp32_audio_ws: Optional[WebSocket] = None # ESP32 音频 WebSocket 连接（单一连接）从硬件接收音频流
 
 # ========== 音色克隆相关变量 ==========
 clone_recording = False  # 是否正在录制克隆音频
@@ -913,6 +946,7 @@ clone_start_time: float = 0.0  # 克隆开始时间
 clone_duration: int = 7  # 克隆录音时长（秒）
 clone_event: Optional[asyncio.Event] = None  # 克隆完成事件
 
+# 入参：pcm_data: 原始 PCM 音频数据（bytes） sample_rate: 音频采样率（Hz） state_holder: 状态持有对象（用于存储颤音效果的相位等状态）
 def apply_donald_duck_effect(pcm_data: bytes, sample_rate: int, state_holder):
     """
     唐老鸭变声器 - 使用 scipy.signal.resample 实现真正的音调变换
@@ -991,6 +1025,7 @@ interrupt_lock = asyncio.Lock()
 # ============== 系统状态 =================
 
 async def ui_broadcast_raw(msg: str):
+    """向所有 UI 客户端广播原始文本消息（不区分 PARTIAL/FINAL）"""
     dead = []
     for k, ws in list(ui_clients.items()):
         try:
@@ -1002,11 +1037,13 @@ async def ui_broadcast_raw(msg: str):
 
 
 async def ui_broadcast_partial(text: str):
+    """广播当前的部分文本（实时更新）"""
     global current_partial
     current_partial = text
     await ui_broadcast_raw("PARTIAL:" + text)
 
 async def ui_broadcast_final(text: str):
+    """广播最终文本，更新最近的完整文本列表"""
     global current_partial, recent_finals
     current_partial = ""
     recent_finals.append(text)
@@ -1059,6 +1096,12 @@ async def start_ai_with_text(user_text: str):
         return
 
     async def _runner():
+        """本方法设计为每次对话的独立运行体，确保状态清晰，避免旧状态干扰新对话
+        AI 处理流程：
+        1) 意图路由：确定用户意图和情绪
+        2) 发送情绪到 ESP32（只发送一次）
+        3) 根据意图选择处理方式（流式文本+TTS 或者特殊处理）
+        """
         txt_buf: List[str] = []
         emotion_sent = False  # 是否已发送情绪到ESP32
         cartoon_states = {"down": None, "up": None}
@@ -1320,7 +1363,7 @@ async def _speak_text_to_broadcast(text: str, voice: str, instruction: Optional[
     
     # 临时保存WAV文件
     runtime_dir = Path("runtime")
-    runtime_dir.mkdir(parents=True, exist_ok=True)
+    runtime_dir.mkdir(parents=True, exist_ok=True) # parents=True确保父目录存在，exist_ok=True避免已存在时报错
     wav_path = runtime_dir / f"tts_{uuid.uuid4().hex}.wav"
     
     try:
@@ -1518,6 +1561,7 @@ register_stream_route(app)
 # ---------- WebSocket：WebUI 文本（ASR/AI 状态推送 + 表情控制） ----------
 @app.websocket("/ws_ui")
 async def ws_ui(ws: WebSocket):
+    """WebUI 连接入口：负责推送 ASR/AI 状态（PARTIAL/FINAL）和接收表情控制命令"""
     await ws.accept()
     ui_clients[id(ws)] = ws
     try:
@@ -1551,6 +1595,7 @@ async def ws_ui(ws: WebSocket):
 # ---------- WebSocket：ESP32 音频入口（ASR 上行） ----------
 @app.websocket("/ws_audio")
 async def ws_audio(ws: WebSocket):
+    """ESP32 音频连接入口：负责接收 ESP32 发送的音频数据，并将其送入 ASR 引擎进行识别，同时下发表情控制指令"""
     global esp32_audio_ws
     esp32_audio_ws = ws
     await ws.accept()
@@ -1560,10 +1605,10 @@ async def ws_audio(ws: WebSocket):
     # idle 动画在 ESP32 端自动执行
     print("[AUDIO] ESP32 已连接，idle 动画自动执行", flush=True)
     
-    recognition = None
-    streaming = False
-    last_ts = time.monotonic()
-    keepalive_task: Optional[asyncio.Task] = None
+    recognition = None # 当前的 ASR 识别器实例（如果有的话）
+    streaming = False # 是否正在进行 ASR 流式识别
+    last_ts = time.monotonic() # 上次收到音频的时间戳（用于静音填充）
+    keepalive_task: Optional[asyncio.Task] = None # 用于发送静音帧的后台任务 (保持ASR会话活跃，防止ESP32端超时)
 
     async def stop_rec(send_notice: Optional[str] = None):
         nonlocal recognition, streaming, keepalive_task
@@ -1590,6 +1635,7 @@ async def ws_audio(ws: WebSocket):
         await stop_rec(send_notice="RESTART")
 
     async def keepalive_loop():
+        """在 ASR 流式识别过程中，如果长时间没有收到音频数据，发送静音帧保持会话活跃，防止 ESP32 端超时断开"""
         nonlocal last_ts, recognition, streaming
         try:
             while streaming and recognition is not None:
@@ -1619,6 +1665,8 @@ async def ws_audio(ws: WebSocket):
                     break
                 raise
 
+            # ESP32 连接后，等待接收文本命令（START/STOP/PROMPT:xxx）和音频数据（bytes），并根据命令控制 ASR 引擎的启动/停止，以及处理音频数据。
+            # START：启动 ASR 流式识别，设置回调处理 partial 和 final结果，更新 UI 状态，并进入冷却期（防止识别到AI残留音频）。同时启动 keepalive_loop 发送静音帧保持会话活跃。
             if "text" in msg and msg["text"] is not None:
                 raw = (msg["text"] or "").strip()
                 cmd = raw.upper()
