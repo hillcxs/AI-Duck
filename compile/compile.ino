@@ -21,6 +21,7 @@
 
 // ---- 新增：SCServo 总线舵机（机械臂）----
 #include <SCServo.h>
+#include <esp_arduino_version.h>
 
 // ---- LED灯带已移除 ----
 
@@ -147,11 +148,19 @@ static void armBusBegin() {
 // D0(GPIO1)=LEFT_PWM, D1(GPIO2)=LEFT_DIR, D2(GPIO3)=RIGHT_PWM, D3(GPIO4)=RIGHT_DIR
 // 若你使用的电机驱动板引脚不同，可直接修改这里的宏。
 // ====================================================================
+#define ENABLE_WHEEL_BASE 0
+
 static const int WHEEL_LEFT_PWM_PIN  = 1;
 static const int WHEEL_LEFT_DIR_PIN  = 2;
 static const int WHEEL_RIGHT_PWM_PIN = 3;
 static const int WHEEL_RIGHT_DIR_PIN = 4;
 static const int WHEEL_PWM_MAX       = 255;
+static const int WHEEL_PWM_FREQ      = 18000;
+static const int WHEEL_PWM_BITS      = 8;
+#if !defined(ESP_ARDUINO_VERSION_MAJOR) || (ESP_ARDUINO_VERSION_MAJOR < 3)
+static const int WHEEL_LEFT_PWM_CH   = 6;
+static const int WHEEL_RIGHT_PWM_CH  = 7;
+#endif
 static const uint32_t WHEEL_CMD_TIMEOUT_MS = 1200;
 
 // 前置声明：底盘 HTTP 处理函数定义在前，WebServer 实例定义在后。
@@ -169,11 +178,23 @@ static float wheelClamp(float v, float lo, float hi) {
 }
 
 static void wheelApplyMotor(int pwmPin, int dirPin, float speed) {
+#if !ENABLE_WHEEL_BASE
+  (void)pwmPin;
+  (void)dirPin;
+  (void)speed;
+  return;
+#else
   speed = wheelClamp(speed, -1.0f, 1.0f);
   bool forward = speed >= 0.0f;
   int pwm = (int)(fabsf(speed) * WHEEL_PWM_MAX);
   digitalWrite(dirPin, forward ? HIGH : LOW);
-  analogWrite(pwmPin, pwm);
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  ledcWrite(pwmPin, pwm);
+#else
+  int ch = (pwmPin == WHEEL_LEFT_PWM_PIN) ? WHEEL_LEFT_PWM_CH : WHEEL_RIGHT_PWM_CH;
+  ledcWrite(ch, pwm);
+#endif
+#endif
 }
 
 static void wheelApplyVW(float v, float w) {
@@ -189,11 +210,23 @@ static void wheelApplyVW(float v, float w) {
 }
 
 static void wheelStopNow() {
-  analogWrite(WHEEL_LEFT_PWM_PIN, 0);
-  analogWrite(WHEEL_RIGHT_PWM_PIN, 0);
+#if !ENABLE_WHEEL_BASE
   wheelCurrentV = 0.0f;
   wheelCurrentW = 0.0f;
   wheelLastCmdMs = millis();
+  return;
+#else
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  ledcWrite(WHEEL_LEFT_PWM_PIN, 0);
+  ledcWrite(WHEEL_RIGHT_PWM_PIN, 0);
+#else
+  ledcWrite(WHEEL_LEFT_PWM_CH, 0);
+  ledcWrite(WHEEL_RIGHT_PWM_CH, 0);
+#endif
+  wheelCurrentV = 0.0f;
+  wheelCurrentW = 0.0f;
+  wheelLastCmdMs = millis();
+#endif
 }
 
 static void wheelSetMode(const String& mode) {
@@ -202,12 +235,27 @@ static void wheelSetMode(const String& mode) {
 }
 
 static void wheelBegin() {
+#if !ENABLE_WHEEL_BASE
+  wheelStopNow();
+  Serial.println("[WHEEL] disabled at compile time");
+  return;
+#else
   pinMode(WHEEL_LEFT_PWM_PIN, OUTPUT);
   pinMode(WHEEL_LEFT_DIR_PIN, OUTPUT);
   pinMode(WHEEL_RIGHT_PWM_PIN, OUTPUT);
   pinMode(WHEEL_RIGHT_DIR_PIN, OUTPUT);
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  ledcAttach(WHEEL_LEFT_PWM_PIN, WHEEL_PWM_FREQ, WHEEL_PWM_BITS);
+  ledcAttach(WHEEL_RIGHT_PWM_PIN, WHEEL_PWM_FREQ, WHEEL_PWM_BITS);
+#else
+  ledcSetup(WHEEL_LEFT_PWM_CH, WHEEL_PWM_FREQ, WHEEL_PWM_BITS);
+  ledcAttachPin(WHEEL_LEFT_PWM_PIN, WHEEL_LEFT_PWM_CH);
+  ledcSetup(WHEEL_RIGHT_PWM_CH, WHEEL_PWM_FREQ, WHEEL_PWM_BITS);
+  ledcAttachPin(WHEEL_RIGHT_PWM_PIN, WHEEL_RIGHT_PWM_CH);
+#endif
   wheelStopNow();
   Serial.println("[WHEEL] two-drive controller ready");
+#endif
 }
 
 static void wheelSafetyTick() {
